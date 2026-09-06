@@ -1,156 +1,188 @@
 import { useReducer } from 'react'
-import type { Case, City, UtilityType, DocumentStatus } from '../types'
-import { DEMO_CASES } from '../data/demoCases'
-import {
-  uid, today, generateDocuments, generateUtilityRequests,
-  refreshCase, auditEntry, updateDocStatus
-} from '../engine/caseEngine'
+import type { ConnectionRequest, RequiredDoc, ConnectionStatus, City, UtilityType } from '../types'
+import { CONNECTIONS } from '../data/connections'
+import { uid, todayStr, logEntry, slaDeadline, computePriority } from '../engine/logic'
+import { PROVIDERS } from '../engine/providers'
 
 export interface AppState {
-  cases: Case[]
-  selectedCaseId: string | null
+  connections: ConnectionRequest[]
+  activeId: string
   view: 'list' | 'detail'
-  aiPanelOpen: boolean
 }
 
-export type Action =
-  | { type: 'SELECT_CASE'; id: string }
-  | { type: 'BACK_TO_LIST' }
-  | { type: 'TOGGLE_AI_PANEL' }
-  | { type: 'CREATE_CASE'; payload: CreateCasePayload }
-  | { type: 'UPDATE_DOC_STATUS'; caseId: string; docId: string; status: DocumentStatus; rejectionReason?: string }
-  | { type: 'SET_SCHEDULED_DATE'; caseId: string; reqId: string; date: string }
-  | { type: 'MARK_INSTALLED'; caseId: string; reqId: string }
-  | { type: 'ADD_AUDIT'; caseId: string; actor: string; action: string; details: string }
-
-export interface CreateCasePayload {
+export interface CreatePayload {
   customerName: string
   customerPhone: string
   customerEmail: string
+  address: string
   city: City
-  fromAddress: string
-  toAddress: string
   moveInDate: string
   utilities: UtilityType[]
 }
 
-function updateCase(cases: Case[], id: string, updater: (c: Case) => Case): Case[] {
-  return cases.map(c => c.id === id ? updater(c) : c)
+export type Action =
+  | { type: 'SELECT'; id: string }
+  | { type: 'BACK' }
+  | { type: 'CREATE'; payload: CreatePayload }
+  | { type: 'UPDATE_DOC'; connId: string; docId: string; patch: Partial<RequiredDoc> }
+  | { type: 'SET_CONN_STATUS'; connId: string; status: ConnectionStatus; note?: string }
+  | { type: 'SCHEDULE_UTIL'; connId: string; utilId: string; date: string }
+  | { type: 'COMPLETE_UTIL'; connId: string; utilId: string }
+  | { type: 'ADD_NOTE'; connId: string; note: string }
+
+function recomputeStatus(conn: ConnectionRequest): ConnectionStatus {
+  if (['submitted', 'scheduled', 'completed'].includes(conn.status)) return conn.status
+  const allVerified = conn.documents.every(d => d.status === 'verified')
+  return allVerified ? 'ready_to_submit' : 'collecting_docs'
+}
+
+function refresh(conn: ConnectionRequest): ConnectionRequest {
+  const today = todayStr()
+  const utilities = conn.utilities.map(u => ({
+    ...u,
+    status: u.status === 'completed' ? 'completed' as const
+      : u.slaDeadline < today ? 'overdue' as const
+      : u.status,
+  }))
+  const updated = { ...conn, utilities, status: recomputeStatus({ ...conn, utilities }) }
+  return { ...updated, priority: computePriority(updated) }
 }
 
 function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
-    case 'SELECT_CASE':
-      return { ...state, selectedCaseId: action.id, view: 'detail', aiPanelOpen: false }
 
-    case 'BACK_TO_LIST':
-      return { ...state, view: 'list', selectedCaseId: null, aiPanelOpen: false }
+    case 'SELECT':
+      return { ...state, activeId: action.id, view: 'detail' }
 
-    case 'TOGGLE_AI_PANEL':
-      return { ...state, aiPanelOpen: !state.aiPanelOpen }
+    case 'BACK':
+      return { ...state, view: 'list' }
 
-    case 'CREATE_CASE': {
+    case 'CREATE': {
       const p = action.payload
-      const id = uid()
-      const documents = generateDocuments(p.city, p.utilities)
-      const utilityRequests = generateUtilityRequests(p.city, p.utilities, p.moveInDate)
-      const base: Case = {
-        id,
-        customerName: p.customerName,
-        customerPhone: p.customerPhone,
-        customerEmail: p.customerEmail,
-        city: p.city,
-        fromAddress: p.fromAddress,
-        toAddress: p.toAddress,
-        moveInDate: p.moveInDate,
-        createdAt: today(),
-        utilities: p.utilities,
-        documents,
-        utilityRequests,
-        exceptions: [],
-        auditLog: [
-          auditEntry('Ops Agent', 'Case Created', `New relocation case created for ${p.customerName} moving to ${p.city} on ${p.moveInDate}`),
-        ],
-        priority: 'on_track',
-        aiInsight: { currentProblem: '', biggestRisk: '', nextAction: '', customerMessage: '', vendorMessage: '' },
-        status: 'active',
+      const id = `QM-${Math.floor(Math.random() * 9000 + 1000)}`
+      const docs: RequiredDoc[] = []
+      const utilities = p.utilities.map(ut => {
+        const prov = PROVIDERS[p.city]?.[ut]
+        if (!prov) return null
+        // Add docs for this utility (deduplicate by name)
+        const existingNames = new Set(docs.map(d => d.name))
+        prov.docs.forEach(d => {
+          if (!existingNames.has(d.name)) {
+            docs.push({ id: uid(), name: d.name, hint: d.hint, status: 'missing' })
+            existingNames.add(d.name)
+          }
+        })
+        const deadline = slaDeadline(p.moveInDate, prov.slaDays)
+        return {
+          id: uid(),
+          type: ut,
+          provider: prov.name,
+          slaDeadline: deadline,
+          status: deadline < todayStr() ? 'overdue' as const : 'pending' as const,
+        }
+      }).filter(Boolean) as ConnectionRequest['utilities']
+
+      // pick tightest sla as the connection sla
+      const sla = utilities.reduce((min, u) => u.slaDeadline < min ? u.slaDeadline : min,
+        utilities[0]?.slaDeadline ?? p.moveInDate)
+
+      const base: ConnectionRequest = {
+        id, customerName: p.customerName, customerPhone: p.customerPhone,
+        customerEmail: p.customerEmail, address: p.address,
+        city: p.city, moveInDate: p.moveInDate,
+        createdAt: todayStr(), slaDeadline: sla,
+        status: 'collecting_docs', priority: 'warning',
+        utilities, documents: docs, notes: [],
+        log: [logEntry('Ops', 'Case Created', `${p.customerName} — ${p.city} — utilities: ${p.utilities.join(', ')}`)],
       }
-      const fresh = refreshCase(base)
-      return { ...state, cases: [fresh, ...state.cases], selectedCaseId: fresh.id, view: 'detail' }
+      const fresh = refresh(base)
+      return { ...state, connections: [fresh, ...state.connections], activeId: fresh.id, view: 'detail' }
     }
 
-    case 'UPDATE_DOC_STATUS': {
-      const cases = updateCase(state.cases, action.caseId, c => {
-        const doc = c.documents.find(d => d.id === action.docId)
-        const updated = updateDocStatus(c, action.docId, action.status, action.rejectionReason)
-        const log = auditEntry(
-          'Ops Agent',
-          `Document ${action.status.charAt(0).toUpperCase() + action.status.slice(1)}`,
-          `"${doc?.name}" marked as ${action.status}${action.rejectionReason ? ': ' + action.rejectionReason : ''}`
+    case 'UPDATE_DOC': {
+      const connections = state.connections.map(conn => {
+        if (conn.id !== action.connId) return conn
+        const documents = conn.documents.map(d =>
+          d.id === action.docId ? { ...d, ...action.patch } : d
         )
-        return { ...updated, auditLog: [...updated.auditLog, log] }
+        const entry = logEntry('Ops',
+          action.patch.status === 'verified' ? 'Document Verified'
+          : action.patch.status === 'rejected' ? 'Document Rejected'
+          : action.patch.status === 'uploaded' ? 'Document Uploaded'
+          : 'Document Updated',
+          `"${conn.documents.find(d => d.id === action.docId)?.name}" → ${action.patch.status ?? ''}${action.patch.rejectionReason ? ': ' + action.patch.rejectionReason : ''}`,
+        )
+        return refresh({ ...conn, documents, log: [...conn.log, entry] })
       })
-      return { ...state, cases }
+      return { ...state, connections }
     }
 
-    case 'SET_SCHEDULED_DATE': {
-      const cases = updateCase(state.cases, action.caseId, c => {
-        const utilityRequests = c.utilityRequests.map(r =>
-          r.id === action.reqId
-            ? { ...r, scheduledDate: action.date, status: 'scheduled' as const }
-            : r
-        )
-        const req = c.utilityRequests.find(r => r.id === action.reqId)
-        const updated = refreshCase({ ...c, utilityRequests })
-        const log = auditEntry(
-          'Ops Agent',
-          'Installation Scheduled',
-          `${req?.type} installation scheduled for ${action.date} with ${req?.provider}`
-        )
-        return { ...updated, auditLog: [...updated.auditLog, log] }
+    case 'SET_CONN_STATUS': {
+      const connections = state.connections.map(conn => {
+        if (conn.id !== action.connId) return conn
+        const entry = logEntry('Ops', 'Status Changed', `→ ${action.status}${action.note ? ': ' + action.note : ''}`)
+        const updated = { ...conn, status: action.status,
+          submittedAt: action.status === 'submitted' ? todayStr() : conn.submittedAt,
+          log: [...conn.log, entry],
+        }
+        return refresh(updated)
       })
-      return { ...state, cases }
+      return { ...state, connections }
     }
 
-    case 'MARK_INSTALLED': {
-      const cases = updateCase(state.cases, action.caseId, c => {
-        const utilityRequests = c.utilityRequests.map(r =>
-          r.id === action.reqId
-            ? { ...r, installedDate: today(), status: 'completed' as const }
-            : r
+    case 'SCHEDULE_UTIL': {
+      const connections = state.connections.map(conn => {
+        if (conn.id !== action.connId) return conn
+        const utilities = conn.utilities.map(u =>
+          u.id === action.utilId ? { ...u, scheduledDate: action.date, status: 'scheduled' as const } : u
         )
-        const req = c.utilityRequests.find(r => r.id === action.reqId)
-        const updated = refreshCase({ ...c, utilityRequests })
-        const log = auditEntry(
-          'Ops Agent',
-          'Utility Installed',
-          `${req?.type} installation completed by ${req?.provider}`
-        )
-        return { ...updated, auditLog: [...updated.auditLog, log] }
+        const u = conn.utilities.find(x => x.id === action.utilId)
+        const entry = logEntry('Ops', 'Installation Scheduled',
+          `${u?.type} (${u?.provider}) — ${action.date}`)
+        return refresh({ ...conn, utilities, log: [...conn.log, entry] })
       })
-      return { ...state, cases }
+      return { ...state, connections }
     }
 
-    case 'ADD_AUDIT': {
-      const cases = updateCase(state.cases, action.caseId, c => ({
-        ...c,
-        auditLog: [...c.auditLog, auditEntry(action.actor, action.action, action.details)]
-      }))
-      return { ...state, cases }
+    case 'COMPLETE_UTIL': {
+      const connections = state.connections.map(conn => {
+        if (conn.id !== action.connId) return conn
+        const utilities = conn.utilities.map(u =>
+          u.id === action.utilId ? { ...u, installedAt: todayStr(), status: 'completed' as const } : u
+        )
+        const u = conn.utilities.find(x => x.id === action.utilId)
+        const allDone = utilities.every(x => x.status === 'completed')
+        const entry = logEntry('Ops', 'Utility Installed', `${u?.type} (${u?.provider}) — done`)
+        return refresh({ ...conn, utilities, status: allDone ? 'completed' : conn.status, log: [...conn.log, entry] })
+      })
+      return { ...state, connections }
     }
 
-    default:
-      return state
+    case 'ADD_NOTE': {
+      const connections = state.connections.map(conn =>
+        conn.id === action.connId
+          ? { ...conn, notes: [...conn.notes, action.note], log: [...conn.log, logEntry('Ops', 'Note Added', action.note)] }
+          : conn
+      )
+      return { ...state, connections }
+    }
+
+    default: return state
   }
 }
 
-const initialState: AppState = {
-  cases: DEMO_CASES,
-  selectedCaseId: null,
-  view: 'list',
-  aiPanelOpen: false,
+export function useStore() {
+  return useReducer(reducer, {
+    connections: CONNECTIONS,
+    activeId: CONNECTIONS[0].id,
+    view: 'detail' as const,
+  })
 }
 
-export function useAppStore() {
-  return useReducer(reducer, initialState)
+export const CONN_STATUS_LABEL: Record<ConnectionStatus, string> = {
+  collecting_docs: 'Collecting Documents',
+  ready_to_submit: 'Ready to Submit',
+  submitted:       'Submitted to Provider',
+  scheduled:       'Installation Scheduled',
+  completed:       'Connection Complete',
 }

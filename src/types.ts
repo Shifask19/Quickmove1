@@ -1,82 +1,64 @@
-export type UtilityType = 'electricity' | 'gas' | 'water' | 'internet' | 'waste'
+export type DocStatus = 'missing' | 'uploading' | 'uploaded' | 'verified' | 'rejected'
 
-export type DocumentStatus = 'missing' | 'uploaded' | 'verified' | 'rejected'
+export type ConnectionStatus =
+  | 'collecting_docs'
+  | 'ready_to_submit'
+  | 'submitted'
+  | 'scheduled'
+  | 'completed'
 
-export type CasePriority = 'critical' | 'warning' | 'on_track'
+export type Priority = 'critical' | 'warning' | 'on_track'
 
-export type ExceptionType =
-  | 'missing_documents'
-  | 'overdue_request'
-  | 'install_after_movein'
-  | 'date_changed'
-  | 'duplicate_request'
-
-export interface Document {
+export interface RequiredDoc {
   id: string
   name: string
-  utility: UtilityType
-  status: DocumentStatus
+  hint: string
+  status: DocStatus
   uploadedAt?: string
   verifiedAt?: string
   rejectionReason?: string
-  required: boolean
+  fileName?: string
+  fileSize?: number
+  fileType?: string
 }
 
-export interface UtilityRequest {
+export interface UtilityReq {
   id: string
-  type: UtilityType
+  type: string
   provider: string
-  requestedAt: string
-  scheduledDate?: string
-  installedDate?: string
   slaDeadline: string
-  status: 'pending' | 'scheduled' | 'completed' | 'overdue' | 'cancelled'
+  scheduledDate?: string
+  installedAt?: string
+  status: 'pending' | 'scheduled' | 'completed' | 'overdue'
 }
 
-export interface Exception {
+export interface LogEntry {
   id: string
-  type: ExceptionType
-  severity: 'critical' | 'warning'
-  message: string
-  utilityId?: string
-  detectedAt: string
-  resolved: boolean
-}
-
-export interface AuditEntry {
-  id: string
-  timestamp: string
+  ts: string
   actor: string
   action: string
-  details: string
+  detail: string
 }
 
-export interface AIInsight {
-  currentProblem: string
-  biggestRisk: string
-  nextAction: string
-  customerMessage: string
-  vendorMessage: string
-}
-
-export type City = 'Mumbai' | 'Delhi' | 'Bangalore' | 'Hyderabad' | 'Chennai' | 'Pune'
-
-export interface Case {
+export interface ConnectionRequest {
   id: string
   customerName: string
   customerPhone: string
   customerEmail: string
-  city: City
-  fromAddress: string
-  toAddress: string
+  address: string
+  city: string
   moveInDate: string
   createdAt: string
-  utilities: UtilityType[]
-  documents: Document[]
-  utilityRequests: UtilityRequest[]
-  exceptions: Exception[]
-  auditLog: AuditEntry[]
-  priority: CasePriority
-  aiInsight: AIInsight
-  status: 'active' | 'completed' | 'on_hold'
+  slaDeadline: string
+  status: ConnectionStatus
+  priority: Priority
+  utilities: UtilityReq[]
+  documents: RequiredDoc[]
+  submittedAt?: string
+  installationDate?: string
+  notes: string[]
+  log: LogEntry[]
 }
+
+export type City = 'Mumbai' | 'Delhi' | 'Bangalore' | 'Hyderabad' | 'Chennai' | 'Pune'
+export type UtilityType = 'electricity' | 'gas' | 'water' | 'internet'
